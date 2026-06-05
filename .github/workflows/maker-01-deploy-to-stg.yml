@@ -1,0 +1,76 @@
+# Maker - STG 環境へデプロイ
+#
+# 【代替案 (v0)】 CICD コンパニオン App が未配備の案件で、
+# Maker が GitHub Actions UI から直接 STG デプロイを依頼するためのラッパー。
+#
+# 内部的に export-from-dev.yml を dispatch する (open_release_pr=true)。
+# DEV から export → develop branch に source + 設定雛型を commit
+# → develop→main の release PR 起票 → auto-merge → deploy-to-stg.yml が連鎖実行される。
+# つまり「DEV から保存」(maker-00) のロジック + release PR 起票だけをやるボタン。
+#
+# 【branch 戦略】 本テンプレートは「簡易 Git Flow」を採用:
+#   - main:    PRD-ready 状態のミラー (release PR と release tag の場)
+#              、「値が埋まった settings + 最新 source」がセットで庋するタイミング
+#   - develop: DEV ミラー (長命、Maker の export ・ 雛型生成 ・ 値編集 は全てここに積まる)
+# Maker は branch を一切意識せず、このボタンを押すだけで反映される。
+#
+# 操作: Actions タブ → "Maker - STG 環境へデプロイ" → "Run workflow"
+#       → Solution 名 / 変更概要 を入力 → "Run"
+#
+# 完了後:
+#   - PR が auto-merge され、STG デプロイが自動実行されます
+#   - 進捗は "01-export-from-dev" / "deploy-to-stg" の run ページで確認
+#
+# 前提:
+#   - DEV 環境で対象 Solution が開発済み (unmanaged)
+#   - 初回 or Connection 再作成時は、先に「maker-03 / 04 で settings に値を埋めている」こと
+#     (未入力だと deploy-to-stg の preflight でブロックされる)
+
+name: Maker - STG 環境へデプロイ
+
+run-name: "STG デプロイ: ${{ inputs.solution_name }} (by @${{ github.actor }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      solution_name:
+        description: "デプロイする Solution の Unique Name (DEV で開発中のもの)"
+        required: true
+        type: string
+        default: "SampleSolution"
+      reason:
+        description: "変更概要 (PR 本文に転記、CoE レビュー用) - 200 字程度"
+        required: true
+        type: string
+        default: "営業ダッシュボードに新規ビューを追加"
+
+permissions:
+  actions: write   # 内部 workflow を dispatch するために必要
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch export-from-dev.yml (リリース PR 起票 = true)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOLUTION_NAME: ${{ inputs.solution_name }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          echo "::notice::Dispatching export-from-dev.yml for ${SOLUTION_NAME}"
+          # 内部 dispatch は常に develop ブランチから起動 (Maker のドロップダウン選択ミスを隠蔽)。
+          gh workflow run export-from-dev.yml \
+            --repo "${{ github.repository }}" \
+            --ref develop \
+            -f solution_name="${SOLUTION_NAME}" \
+            -f reason="${REASON}" \
+            -f open_release_pr=true
+
+      - name: Show status link
+        run: |
+          ACTIONS_URL="${{ github.server_url }}/${{ github.repository }}/actions/workflows/export-from-dev.yml"
+          echo "::notice::デプロイを受け付けました。"
+          echo "::notice::進捗: ${ACTIONS_URL}"
+          echo "::notice::export → develop へ commit → develop→main の release PR → auto-merge → STG deploy が連鎖実行されます (数分かかります)"

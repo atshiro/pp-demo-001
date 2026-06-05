@@ -1,0 +1,279 @@
+# Maker - リリースタグを付ける (STG / PRD)
+#
+# 【何をする workflow か】
+# 「この時点の状態を後から呼び出せるように、目印 (tag + Release) を付ける」 だけです。
+# Maker は git CLI / ターミナル操作なしで、画面入力だけで完結します。
+#
+# 【こういう時に使う】
+#   - STG の動作確認が OK だった時 → `stg` を選んで実行 (Step 15.5)
+#     → CoE はこの Release tag を deploy-to-prd の git_tag input に渡して PRD 起動
+#   - PRD の動作確認が OK だった時 → `prd` を選んで実行 (Step 19.5)
+#
+# 【何が起きるか (env=stg)】
+#   1. `main` branch の最新 commit に `v<version>-stg-verified` annotated tag を付与
+#   2. 直近成功した STG deploy run の workflow artifact (managed solution zip) を download
+#   3. その tag で GitHub Release を作成し、zip を asset として attach
+#      → これにより PRD deploy が `gh release download` で同一バイナリを取得可能
+#         (= STG で動作確認したまさにそのバイナリが PRD に流れる、A2 設計の要)
+#
+# 【何が起きるか (env=prd)】
+#   1. `main` branch の最新 commit に `v<version>-prd-verified` annotated tag を付与
+#   2. 既存の `v<version>-stg-verified` Release から zip を download
+#   3. `v<version>-prd-verified` Release を作成し、同一の zip を attach
+#      (PRD 反映済みアーティファクトの長期保存目的。ロールバック時に参照)
+#
+# 【入力】
+#   - environment : stg | prd  (タグ末尾 `-stg-ready` / `-prd-ready` を決める)
+#   - version     : セマンティックバージョン (例: `0.1.0`、先頭の `v` は付けない)
+#   - solution_name : Release に attach する zip を特定するため必須
+#   - notes       : 任意。タグメッセージ + Release notes
+#
+# 【命名規約】
+#   - `v<MAJOR>.<MINOR>.<PATCH>-stg-ready`   例: `v0.1.0-stg-ready`
+#   - `v<MAJOR>.<MINOR>.<PATCH>-prd-ready`   例: `v0.1.0-prd-ready`
+#
+# 【前提】
+#   - env=stg: 対象 Solution の STG deploy が成功し、動作確認まで終わっていること
+#              (workflow artifact の取得には `actions: read` 権限が必要 = GITHUB_TOKEN で OK)
+#   - env=prd: 同じ version の `v<version>-stg-verified` Release が存在し PRD deploy 成功済み
+#   - STG → PRD の順で打つこと
+#
+# STEP-OWNER: 表 2 Step 15.5 / 19.5 のワークフロー化。
+
+name: Maker - リリースタグを付ける
+
+run-name: "タグ付与: v${{ inputs.version }}-${{ inputs.environment }}-verified (by @${{ github.actor }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "対象環境 (stg | prd) — タグ末尾を決める"
+        required: true
+        type: choice
+        default: stg
+        options:
+          - stg
+          - prd
+      version:
+        description: "バージョン番号 (例: 0.1.0、先頭の v は付けない)"
+        required: true
+        type: string
+        default: "0.1.0"
+      solution_name:
+        description: "Solution の Unique Name (Release に attach する zip を特定するため)"
+        required: true
+        type: string
+        default: "SampleSolution"
+      notes:
+        description: "タグメッセージ (任意) — 例: 'STG 初回リリース動作確認 OK'"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write   # tag push + Release 作成
+  actions: read     # 過去 STG deploy run の artifact download
+
+concurrency:
+  group: maker-05-tag-${{ inputs.version }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate version format
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version は MAJOR.MINOR.PATCH 形式で入力してください (例: 0.1.0)。入力値: '$VERSION'"
+            exit 1
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Create and push tag
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          VERSION: ${{ inputs.version }}
+          NOTES: ${{ inputs.notes }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}-${ENVIRONMENT}-verified"
+
+          # 既に同名タグがあれば中断 (上書きは事故の元)
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::タグ '${TAG}' は既に存在します。version を上げるか、不要なら手動で削除してください。"
+            exit 1
+          fi
+
+          # 既定メッセージ (notes 未入力時)
+          if [[ -z "${NOTES}" ]]; then
+            MSG="${TAG} (tagged by @${ACTOR} via maker-05-tag-release)"
+          else
+            MSG="${NOTES}"$'\n\n'"(tagged by @${ACTOR} via maker-05-tag-release)"
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "${TAG}" -m "${MSG}"
+          git push origin "${TAG}"
+
+          SHA="$(git rev-parse "${TAG}^{commit}")"
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "SHA=${SHA}" >> "$GITHUB_ENV"
+
+      # ──────────────────────────────────────────────────────────
+      # env=stg: 直近成功 STG deploy run の artifact を取得して Release に attach
+      # ──────────────────────────────────────────────────────────
+      - name: Locate latest successful STG deploy run for this commit
+        if: inputs.environment == 'stg'
+        id: stg-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ env.SHA }}
+        run: |
+          set -euo pipefail
+          # main の最新 commit (= tag を打った commit) に対する STG deploy run のうち、
+          # success したものの最新を探す。
+          RUN_ID=$(gh run list \
+            --workflow "03-deploy-to-stg" \
+            --branch main \
+            --status success \
+            --limit 20 \
+            --json databaseId,headSha \
+            --jq "[.[] | select(.headSha == \"$SHA\")] | .[0].databaseId // empty")
+
+          if [ -z "$RUN_ID" ]; then
+            # commit SHA 完全一致が見つからない場合は最新の成功 run を fallback として使うが warning
+            RUN_ID=$(gh run list \
+              --workflow "03-deploy-to-stg" \
+              --branch main \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty')
+            if [ -z "$RUN_ID" ]; then
+              echo "::error::main の成功した STG deploy run が見つかりません。先に Step 09 (maker-01) で STG deploy を成功させてください。"
+              exit 1
+            fi
+            echo "::warning::tag を打った commit ($SHA) に対する STG deploy run が見つからなかったため、main 最新の成功 run (#$RUN_ID) の artifact を使います。STG 動作確認後に main が進んでいないか確認してください。"
+          else
+            echo "::notice::commit $SHA の STG deploy run #$RUN_ID を使用"
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download managed Solution artifact from STG run
+        if: inputs.environment == 'stg'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.stg-run.outputs.run_id }}
+          SOLUTION_NAME: ${{ inputs.solution_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          ARTIFACT_NAME="${SOLUTION_NAME}-managed"
+          gh run download "$RUN_ID" \
+            --name "$ARTIFACT_NAME" \
+            --dir release-assets
+          ls -la release-assets/
+          if [ ! -f "release-assets/${SOLUTION_NAME}_managed.zip" ]; then
+            echo "::error::artifact から ${SOLUTION_NAME}_managed.zip を取得できませんでした。"
+            exit 1
+          fi
+
+      # ──────────────────────────────────────────────────────────
+      # env=prd: 既存 stg-verified Release から zip を取得して prd-verified Release に同一 zip を attach
+      # ────────────────────────────────────────────────────────
+      - name: Download zip from stg-verified Release
+        if: inputs.environment == 'prd'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          SOLUTION_NAME: ${{ inputs.solution_name }}
+        run: |
+          set -euo pipefail
+          STG_TAG="v${VERSION}-stg-verified"
+          if ! gh release view "$STG_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::Release '$STG_TAG' が見つかりません。先に env=stg で maker-05 を実行してください。"
+            exit 1
+          fi
+          mkdir -p release-assets
+          gh release download "$STG_TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern "${SOLUTION_NAME}_managed.zip" \
+            --dir release-assets
+          ls -la release-assets/
+
+      # ──────────────────────────────────────────────────────────
+      # 共通: Release を作成し zip を attach
+      # ──────────────────────────────────────────────────────────
+      - name: Create GitHub Release with managed Solution
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.TAG }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          NOTES: ${{ inputs.notes }}
+          ACTOR: ${{ github.actor }}
+          SOLUTION_NAME: ${{ inputs.solution_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$ENVIRONMENT" == "stg" ]]; then
+            HEADER="STG 動作確認完了マーカー。この managed zip は PRD deploy (deploy-to-prd の git_tag input) に \`${TAG}\` を指定することで PRD へ展開可能。"
+          else
+            HEADER="PRD 反映済みマーカー。\`v$(echo "$TAG" | sed -E 's/v([0-9.]+)-prd-verified/\1/')-stg-verified\` と同一の managed zip を保管 (ロールバック / 監査用)。"
+          fi
+          BODY="${HEADER}"$'\n\n'"**Solution**: \`${SOLUTION_NAME}\`"$'\n'"**Tagged by**: @${ACTOR}"
+          if [[ -n "${NOTES}" ]]; then
+            BODY="${BODY}"$'\n\n'"**Notes**:"$'\n'"${NOTES}"
+          fi
+
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "${TAG}" \
+            --notes "${BODY}" \
+            release-assets/${SOLUTION_NAME}_managed.zip
+
+      - name: Publish summary
+        env:
+          TAG: ${{ env.TAG }}
+          SHA: ${{ env.SHA }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          SOLUTION_NAME: ${{ inputs.solution_name }}
+        run: |
+          set -euo pipefail
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          {
+            echo "# リリースタグ + Release を作成しました"
+            echo ""
+            echo "| 項目 | 値 |"
+            echo "|---|---|"
+            echo "| タグ名 | \`${TAG}\` |"
+            echo "| 対象 commit | [\`${SHA:0:7}\`](${REPO_URL}/commit/${SHA}) |"
+            echo "| Release | [${TAG}](${REPO_URL}/releases/tag/${TAG}) |"
+            echo "| Attached | \`${SOLUTION_NAME}_managed.zip\` |"
+            echo ""
+            if [[ "$ENVIRONMENT" == "stg" ]]; then
+              echo "## 次のステップ (PRD 展開)"
+              echo ""
+              echo "1. CoE に「PRD 展開してください」と連絡 (この Release tag \`${TAG}\` を伝える)"
+              echo "2. CoE が Actions タブ → \"05-deploy-to-prd\" → Run workflow → git_tag=\`${TAG}\` を指定して起動"
+              echo "3. environment: prd の reviewer 承認 → PRD import"
+            else
+              echo "## 次のステップ"
+              echo ""
+              echo "- 案件クローズ / 運用引き渡し"
+              echo "- ロールバック時は本 Release の zip を CoE が手動 import"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice::タグ ${TAG} + Release を作成しました (commit ${SHA:0:7})"
